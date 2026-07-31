@@ -14,9 +14,12 @@ LangGraph로 직접 구현한 버전. "에이전트 도구 활용 → 프레임�
 ## 그래프 설계
 
 ```
-START → planner → executor → evaluator ─┬─ done ──→ finish → END
-          ▲                             ├─ retry ─→ planner (최대 3회)
-          └─────────────────────────────┘  fail ──→ finish → END
+START → selector → planner → executor → evaluator ─┬─ done/fail → finish → slack_report → END
+                     ▲                             │
+                     └──────── retry (최대 3회) ────┘
+
+selector     = 과제 인자가 없으면 RESEARCH_BACKLOG.md 최상위 항목 자동 선정
+slack_report = SLACK_WEBHOOK_URL 설정 시 결과를 슬랙 DM으로 발송 (미설정 시 무시)
 ```
 
 | 노드 | 역할 | 두뇌 |
@@ -36,7 +39,8 @@ START → planner → executor → evaluator ─┬─ done ──→ finish →
 ```bash
 # 1) 실제 실행 — 기본: 클로드 CLI 두뇌 (claude 로그인만 돼 있으면 준비물 0)
 .venv/bin/python agent.py "이 폴더의 csv 파일 각각의 데이터 행 수를 세서 보고하라"
-# ✅ 2026-07-31 실동 검증: planner가 셸 루프 제안 → 실행 → evaluator done, 1회 시도 성공
+.venv/bin/python agent.py          # 과제 생략 → 백로그 최상위 항목 자동 선정
+# ✅ 2026-07-31 실동 검증 2회: 1회 시도 성공 / 경로 착오→retry 자가복구 후 성공+슬랙 보고
 
 # 2) 스모크 테스트 (LLM 불필요 — 그래프 역학만 검증)
 .venv/bin/python agent.py --mock "스모크 테스트"
@@ -62,7 +66,12 @@ vllm serve Qwen/Qwen2.5-7B-Instruct --port 8000   # 별도 터미널
 
 ## 로드맵
 
-1. `RESEARCH_BACKLOG.md`를 읽어 과제를 자동 선정하는 `selector` 노드
-2. 실제 실험 명령(학습 스크립트) 실행 + 로그 파싱 노드
-3. 종료 시 Slack webhook 보고 노드 (`finish` 뒤에 추가)
-4. 체크포인터로 중단·재개 (LangGraph `checkpointer`)
+1. ~~`selector` 노드 — 백로그 자동 선정~~ ✅ (07-31)
+2. ~~Slack webhook 보고 노드~~ ✅ (07-31)
+3. 장시간 실험 지원 — 학습을 백그라운드 발사 + 주기 폴링 노드 (연구 주력화의 관문)
+4. 다단계 계획 — plan을 명령 목록으로 확장
+5. 체크포인터로 중단·재개 (LangGraph `checkpointer`)
+
+### 실전에서 배운 하네스 설계 교훈
+- evaluator가 "계획의 성공기준"만 보면 과제 일부 달성을 done으로 오판한다 →
+  원래 과제를 판정 입력에 포함하고 "부분 달성=retry"를 명시 (07-31 수정)

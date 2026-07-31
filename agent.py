@@ -6,7 +6,8 @@ Claude Code CLI(`claude -p`, 구독으로 처리)이고 로컬 vLLM으로 교체
 
 사용법:
     python agent.py "sandbox/ 안의 csv 행 수를 세라"   # 기본: 클로드 CLI 두뇌
-    python agent.py --mock "smoke test 과제"          # LLM 없이 그래프 검증
+    python agent.py                                   # 과제 생략 → 백로그 최상위 항목 자동 선정
+    python agent.py --mock ["smoke test 과제"]        # LLM 없이 그래프 검증
     python agent.py --vllm "..."                      # 로컬 vLLM 두뇌 (vllm serve 필요)
 
 환경변수:
@@ -15,6 +16,8 @@ Claude Code CLI(`claude -p`, 구독으로 처리)이고 로컬 vLLM으로 교체
     VLLM_MODEL      기본 Qwen/Qwen2.5-7B-Instruct
     AGENT_WORKDIR   명령이 실행될 작업 디렉터리 (기본: ./sandbox)
     AGENT_CMD_TIMEOUT  명령 타임아웃 초 (기본 120)
+    BACKLOG_PATH    백로그 파일 (기본 /workspace/RESEARCH_BACKLOG.md)
+    SLACK_WEBHOOK_URL  설정돼 있으면 종료 시 결과를 슬랙으로 발송 (미설정 시 생략)
 """
 
 from __future__ import annotations
@@ -53,9 +56,10 @@ PLANNER_SYSTEM = (
 )
 
 EVALUATOR_SYSTEM = (
-    "너는 실행 결과 평가자다. 성공 기준과 명령의 stdout/stderr/returncode를 보고 판정하라. "
+    "너는 실행 결과 평가자다. '원래 과제'가 완수됐는지를 기준으로 판정하라 — 계획의 성공 기준은 "
+    "참고일 뿐, 과제의 일부만 달성했으면 done이 아니라 retry다. "
     '반드시 JSON 하나만 출력하라: {"verdict": "done|retry|fail", "reason": "..."} '
-    "done=기준 충족, retry=다른 명령으로 재시도할 가치 있음, fail=이 과제는 이 루프로 달성 불가."
+    "done=과제 완수, retry=추가 명령으로 계속 진행할 가치 있음, fail=이 과제는 이 루프로 달성 불가."
 )
 
 
@@ -145,6 +149,28 @@ DENY_PATTERNS = [
 ]
 
 
+def load_backlog_task() -> str:
+    """백로그의 '진행 대기' 최상위 항목을 과제 문자열로 변환."""
+    path = os.environ.get("BACKLOG_PATH", "/workspace/RESEARCH_BACKLOG.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except FileNotFoundError:
+        raise SystemExit(f"백로그 파일 없음: {path} (과제를 인자로 직접 주거나 BACKLOG_PATH 설정)")
+    section = re.search(r"## 진행 대기\n(.*?)(?:\n## |\Z)", text, re.S)
+    item = section and re.search(r"^\s*\d+\.\s+(.+)$", section.group(1), re.M)
+    if not item:
+        raise SystemExit(f"백로그 '진행 대기'에 항목이 없음: {path}")
+    return re.sub(r"\*\*", "", item.group(1)).strip()
+
+
+def selector(state: AgentState) -> dict:
+    if state["task"]:
+        return {}
+    task = load_backlog_task()
+    print(f"[selector] 백로그 최상위 항목 선정: {task!r}")
+    return {"task": task}
+
+
 def planner(state: AgentState) -> dict:
     user = json.dumps(
         {"task": state["task"], "history": state["history"][-3:]}, ensure_ascii=False
@@ -186,6 +212,7 @@ def evaluator(state: AgentState) -> dict:
     last = state["history"][-1]
     user = json.dumps(
         {
+            "task": state["task"],
             "success_criteria": (state["plan"] or {}).get("success_criteria"),
             "stdout": last["stdout"], "stderr": last["stderr"], "returncode": last["returncode"],
         },
@@ -213,6 +240,32 @@ def finish(state: AgentState) -> dict:
     return {"result": result}
 
 
+def slack_report(state: AgentState) -> dict:
+    """SLACK_WEBHOOK_URL이 설정된 경우에만 결과를 DM으로 발송."""
+    url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    if not url:
+        return {}
+    import urllib.request
+
+    ok = state["verdict"] == "done"
+    last = state["history"][-1] if state["history"] else {}
+    text = (
+        f"🔬 LangGraph 연구 에이전트 보고\n"
+        f"과제: {state['task']}\n"
+        f"결과: {'✅ 성공' if ok else '❌ 실패'} ({state['iteration']}회 시도)\n"
+        f"판정: {last.get('reason', '')}"
+    )
+    req = urllib.request.Request(
+        url, data=json.dumps({"text": text}).encode(), headers={"Content-type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"[slack] 발송 완료 (HTTP {resp.status})")
+    except Exception as exc:  # 보고 실패가 에이전트 실패가 되어선 안 됨
+        print(f"[slack] 발송 실패: {exc}")
+    return {}
+
+
 def route_after_eval(state: AgentState) -> str:
     return {"done": "finish", "retry": "planner", "fail": "finish"}[state["verdict"]]
 
@@ -222,22 +275,26 @@ def route_after_eval(state: AgentState) -> str:
 
 def build_app():
     graph = StateGraph(AgentState)
+    graph.add_node("selector", selector)
     graph.add_node("planner", planner)
     graph.add_node("executor", executor)
     graph.add_node("evaluator", evaluator)
     graph.add_node("finish", finish)
-    graph.add_edge(START, "planner")
+    graph.add_node("slack_report", slack_report)
+    graph.add_edge(START, "selector")
+    graph.add_edge("selector", "planner")
     graph.add_edge("planner", "executor")
     graph.add_edge("executor", "evaluator")
     graph.add_conditional_edges("evaluator", route_after_eval, {"planner": "planner", "finish": "finish"})
-    graph.add_edge("finish", END)
+    graph.add_edge("finish", "slack_report")
+    graph.add_edge("slack_report", END)
     return graph.compile()
 
 
 def main() -> int:
     global LLM
     parser = argparse.ArgumentParser(description="LangGraph 연구 에이전트")
-    parser.add_argument("task", help="수행할 과제 (자연어)")
+    parser.add_argument("task", nargs="?", default="", help="수행할 과제 (자연어). 생략하면 백로그 최상위 항목 자동 선정")
     parser.add_argument("--mock", action="store_true", help="LLM 없이 그래프 스모크 테스트")
     parser.add_argument("--vllm", action="store_true", help="클로드 CLI 대신 로컬 vLLM 두뇌 사용")
     args = parser.parse_args()
