@@ -7,6 +7,7 @@ Claude Code CLI(`claude -p`, 구독으로 처리)이고 로컬 vLLM으로 교체
 사용법:
     python agent.py "sandbox/ 안의 csv 행 수를 세라"   # 기본: 클로드 CLI 두뇌
     python agent.py                                   # 과제 생략 → 백로그 최상위 항목 자동 선정
+    python agent.py --spec spec.md                    # definer.py가 정의한 스펙을 과제로 사용
     python agent.py --mock ["smoke test 과제"]        # LLM 없이 그래프 검증
     python agent.py --vllm "..."                      # 로컬 vLLM 두뇌 (vllm serve 필요)
 
@@ -295,14 +296,17 @@ def main() -> int:
     global LLM
     parser = argparse.ArgumentParser(description="LangGraph 연구 에이전트")
     parser.add_argument("task", nargs="?", default="", help="수행할 과제 (자연어). 생략하면 백로그 최상위 항목 자동 선정")
+    parser.add_argument("--spec", default="", help="definer.py가 만든 스펙 파일을 과제로 사용")
     parser.add_argument("--mock", action="store_true", help="LLM 없이 그래프 스모크 테스트")
     parser.add_argument("--vllm", action="store_true", help="클로드 CLI 대신 로컬 vLLM 두뇌 사용")
     args = parser.parse_args()
 
+    task = open(args.spec, encoding="utf-8").read() if args.spec else args.task
+
     LLM = MockLLM() if args.mock else (VllmLLM() if args.vllm else ClaudeCliLLM())
     app = build_app()
     final = app.invoke(
-        {"task": args.task, "plan": None, "history": [], "result": "", "verdict": "", "iteration": 0}
+        {"task": task, "plan": None, "history": [], "result": "", "verdict": "", "iteration": 0}
     )
     return 0 if final["verdict"] == "done" else 1
 
