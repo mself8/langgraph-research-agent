@@ -194,7 +194,9 @@ LLM 관련 변수는 `agent.py`와 공유.
 1. ~~`selector` 노드 — 백로그 자동 선정~~ ✅ (07-31)
 2. ~~Slack webhook 보고 노드~~ ✅ (07-31)
 2-1. ~~`definer.py` — 문제 정의 그래프~~ ✅ (08-03)
-2-2. **결정론적 evaluator** — `--spec`으로 받은 스펙의 `verification_command`를 실제로
+2-2. **구조화된 결과물 검사(09-06 구현)**: `--acceptance`로 파일·CSV·JSON 완료 조건을 지정할 수 있습니다. [기능과 한계](docs/acceptance_feature.md), [실행 데모](docs/acceptance_demo.html). 자유 형식 검증 명령의 자동 실행은 미구현입니다.
+
+   기존 검토안 — **결정론적 evaluator** — `--spec`으로 받은 스펙의 `verification_command`를 실제로
    실행해 그 종료코드를 판정 근거로 삼는다. 지금은 evaluator가 LLM 의견으로 판정하는데,
    이러면 아래 "부분 달성을 done으로 오판" 문제가 구조적으로 사라진다.
 3. 장시간 실험 지원 — 학습을 백그라운드 발사 + 주기 폴링 노드 (연구 주력화의 관문)
@@ -239,3 +241,8 @@ LLM 관련 변수는 `agent.py`와 공유.
   수렴하면 검증 결과가 스펙에 한 번도 반영되지 않았다(첫 실동에서 "grounding이 비어 있어
   확인 못 했다"는 가정이 그대로 남음). → grounder 실패 시 해석 비교로 넘어가지 않고
   drafter로 되돌리는 조건부 엣지 추가 (08-03)
+
+
+## 2026-09-06: 실행 전 완료 조건
+
+`--acceptance examples/acceptance.json`으로 완료 조건을 지정하면 LLM 완료 의견 대신 결과물 검사를 사용합니다. `--report-json`으로 각 시도와 실패 원인을 저장합니다. 데모·검증·한계는 [추가 기능 문서](docs/acceptance_feature.md)를 참고하세요.

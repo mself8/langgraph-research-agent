@@ -31,6 +31,8 @@ import subprocess
 import sys
 from typing import TypedDict
 
+from acceptance import check_artifacts, load_contract
+
 from langgraph.graph import END, START, StateGraph
 
 MAX_ITERS = 3
@@ -45,6 +47,8 @@ class AgentState(TypedDict):
     result: str
     verdict: str            # "" | done | retry | fail
     iteration: int
+    acceptance: list[dict]  # 실행 전에 사용자가 정한 완료 조건
+    notify_slack: bool
 
 
 # ---------------------------------------------------------------- LLM 어댑터
@@ -117,7 +121,7 @@ class ClaudeCliLLM:
             "주의: 도구를 사용하지 말고, 설명 없이 위 형식의 JSON 오브젝트 하나만 출력하라."
         )
         proc = subprocess.run(
-            [self.bin, "-p", prompt, "--output-format", "text"],
+            [self.bin, "-p", prompt, "--output-format", "text", "--tools", "", "--strict-mcp-config"],
             capture_output=True, text=True,
             timeout=int(os.environ.get("CLAUDE_TIMEOUT", "180")),
         )
@@ -174,7 +178,8 @@ def selector(state: AgentState) -> dict:
 
 def planner(state: AgentState) -> dict:
     user = json.dumps(
-        {"task": state["task"], "history": state["history"][-3:]}, ensure_ascii=False
+        {"task": state["task"], "history": state["history"][-3:],
+         "acceptance": state.get("acceptance", [])}, ensure_ascii=False
     )
     plan = parse_json_block(LLM.complete(PLANNER_SYSTEM, user))
     print(f"[planner] iter {state['iteration'] + 1}: {plan.get('command')!r}")
@@ -211,16 +216,37 @@ def executor(state: AgentState) -> dict:
 
 def evaluator(state: AgentState) -> dict:
     last = state["history"][-1]
-    user = json.dumps(
-        {
-            "task": state["task"],
-            "success_criteria": (state["plan"] or {}).get("success_criteria"),
-            "stdout": last["stdout"], "stderr": last["stderr"], "returncode": last["returncode"],
-        },
-        ensure_ascii=False,
-    )
-    judged = parse_json_block(LLM.complete(EVALUATOR_SYSTEM, user))
+    checks = state.get("acceptance", [])
+    if checks:
+        workdir = os.environ.get("AGENT_WORKDIR", os.path.join(os.path.dirname(__file__), "sandbox"))
+        validation = check_artifacts(checks, workdir)
+        last["validation"] = validation
+        # A failed command cannot claim success from leftover artifacts.
+        passed = last["returncode"] == 0 and validation["passed"]
+        failures = [f"{x['id']}: {x['detail']}" for x in validation["checks"] if not x["passed"]]
+        if last["returncode"] != 0:
+            failures.insert(0, f"실행 실패 rc={last['returncode']}")
+        judged = {
+            "verdict": "done" if passed else "retry",
+            "reason": "사용자 지정 결과물 조건을 모두 확인" if passed else "; ".join(failures),
+        }
+        last["evaluation_mode"] = "artifact_checks"
+    elif last["returncode"] != 0:
+        judged = {"verdict": "retry", "reason": f"실행 실패 rc={last['returncode']}"}
+        last["evaluation_mode"] = "execution_failure"
+    else:
+        user = json.dumps(
+            {
+                "task": state["task"],
+                "success_criteria": (state["plan"] or {}).get("success_criteria"),
+                "stdout": last["stdout"], "stderr": last["stderr"], "returncode": last["returncode"],
+            }, ensure_ascii=False,
+        )
+        judged = parse_json_block(LLM.complete(EVALUATOR_SYSTEM, user))
+        last["evaluation_mode"] = "llm_judgment"
     verdict = judged.get("verdict", "fail")
+    if verdict not in {"done", "retry", "fail"}:
+        verdict, judged["reason"] = "fail", "지원하지 않는 판정값"
     if verdict == "retry" and state["iteration"] >= MAX_ITERS:
         verdict, judged["reason"] = "fail", f"최대 반복({MAX_ITERS}) 도달: {judged.get('reason')}"
     last.update(verdict=verdict, reason=judged.get("reason"))
@@ -243,6 +269,8 @@ def finish(state: AgentState) -> dict:
 
 def slack_report(state: AgentState) -> dict:
     """SLACK_WEBHOOK_URL이 설정된 경우에만 결과를 DM으로 발송."""
+    if not state.get("notify_slack", True):
+        return {}
     url = os.environ.get("SLACK_WEBHOOK_URL", "")
     if not url:
         return {}
@@ -299,15 +327,28 @@ def main() -> int:
     parser.add_argument("--spec", default="", help="definer.py가 만든 스펙 파일을 과제로 사용")
     parser.add_argument("--mock", action="store_true", help="LLM 없이 그래프 스모크 테스트")
     parser.add_argument("--vllm", action="store_true", help="클로드 CLI 대신 로컬 vLLM 두뇌 사용")
+    parser.add_argument("--acceptance", default="", help="사용자가 실행 전에 작성한 결과물 완료 조건 JSON")
+    parser.add_argument("--report-json", default="", help="시도별 실행·검사 결과를 JSON으로 저장")
+    parser.add_argument("--no-slack", action="store_true", help="Slack 보고 발송 끄기")
     args = parser.parse_args()
+    try:
+        acceptance = load_contract(args.acceptance) if args.acceptance else []
+    except (OSError, ValueError) as exc:
+        parser.error(f"완료 조건을 읽을 수 없습니다: {exc}")
 
     task = open(args.spec, encoding="utf-8").read() if args.spec else args.task
 
     LLM = MockLLM() if args.mock else (VllmLLM() if args.vllm else ClaudeCliLLM())
     app = build_app()
     final = app.invoke(
-        {"task": task, "plan": None, "history": [], "result": "", "verdict": "", "iteration": 0}
+        {"task": task, "plan": None, "history": [], "result": "", "verdict": "", "iteration": 0,
+         "acceptance": acceptance, "notify_slack": not args.no_slack}
     )
+    if args.report_json:
+        from pathlib import Path
+        report = Path(args.report_json)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0 if final["verdict"] == "done" else 1
 
 

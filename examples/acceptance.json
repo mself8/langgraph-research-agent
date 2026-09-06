@@ -1,0 +1,4 @@
+[
+  {"id":"season_table","kind":"csv_table","path":"season_counts.csv","columns":["season","matches"],"exact_rows":5},
+  {"id":"summary","kind":"text_contains","path":"summary.md","contains":["## 결과","## 한계"]}
+]
